@@ -1,194 +1,209 @@
 /*
- * main.c — Placa B
- * Comunicação UART half-duplex em turnos usando threads + mutex + ISR
+ * main.c  --  PLACA B (FRDM KL25Z)
  *
- * Comportamento da placa B:
- *   - Primeiro entra em MODO RECEPÇÃO por 5s
- *   - Depois entra em MODO TRANSMISSÃO por 5s
+ * Comportamento:
+ *  - Inicia em modo RX (5s) com LED verde ligado
+ *  - Depois alterna para TX (5s) enviando mensagens pela UART1
+ *  - Repete o ciclo indefinidamente
  *
- *   Isso é o inverso da placa A, permitindo troca de mensagens em turnos.
+ * Observações:
+ *  - Comunicação entre placas via UART1 (DT nodelabel: uart1)
+ *  - Monitor serial permanece UART0 (printk)
+ *  - Callback de RX montando linhas/frames mesmo sem CR/LF
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/devicetree.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/sys/printk.h>
 #include <string.h>
-#include <errno.h>
 
-#define MSG_SIZE 32
+/* ---------- UART1 ---------- */
+#define UART1_NODE DT_NODELABEL(uart1)
+static const struct device *const uart_dev = DEVICE_DT_GET(UART1_NODE);
 
-#ifndef DT_CHOSEN_zephyr_shell_uart
-#error "DT_CHOSEN(zephyr_shell_uart) não está definido para esta placa."
+/* ---------- LED (opcional) ---------- */
+#ifdef DT_ALIAS_LED0
+#define LED0_NODE DT_ALIAS(led0)
+static const struct device *led_dev = DEVICE_DT_GET(DT_GPIO_CTLR(LED0_NODE, gpios));
+static const gpio_pin_t led_pin = DT_GPIO_PIN(LED0_NODE, gpios);
+static const gpio_flags_t led_flags = DT_GPIO_FLAGS(LED0_NODE, gpios);
+#else
+static const struct device *led_dev = NULL;
+static const gpio_pin_t led_pin = 0;
+static const gpio_flags_t led_flags = 0;
 #endif
 
-#define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
-
-/* --- Objetos globais --- */
+/* ---------- Mensagens / fila / mutex / threads ---------- */
+#define MSG_SIZE 64
 K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 10, 4);
+
 K_MUTEX_DEFINE(tx_rx_mutex);
 
-K_THREAD_STACK_DEFINE(tx_stack, 1536);
-K_THREAD_STACK_DEFINE(rx_stack, 1536);
-static struct k_thread tx_thread_data;
-static struct k_thread rx_thread_data;
+/* Stacks */
+K_THREAD_STACK_DEFINE(tx_stack, 1024);
+K_THREAD_STACK_DEFINE(rx_stack, 1024);
 
-static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+/* Thread control */
+struct k_thread tx_thread_data;
+struct k_thread rx_thread_data;
 
+/* Buffer de montagem */
 static char rx_buf[MSG_SIZE];
-static int rx_buf_pos = 0;
+static int rx_pos = 0;
 
-/* ---------- Função de envio ---------- */
-static void print_uart(const char *buf)
+/* ---------- Callback UART RX (ISR) ---------- */
+void serial_cb(const struct device *dev, void *user_data)
 {
-    if (!buf || !uart_dev) return;
+    uint8_t c;
 
-    for (size_t i = 0; i < strlen(buf); i++) {
+    /* lê FIFO até esvaziar */
+    while (uart_fifo_read(uart_dev, &c, 1) == 1) {
+        rx_buf[rx_pos++] = c;
+
+        /* Se receber terminador ou buffer encher -> envia para fila */
+        if (rx_pos >= MSG_SIZE - 1 || c == '\n' || c == '\r') {
+            rx_buf[rx_pos] = '\0';
+            /* tenta colocar na fila sem bloquear; se falhar, descartamos a mensagem */
+            k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
+            rx_pos = 0;
+        }
+    }
+}
+
+/* ---------- Envio via UART1 ---------- */
+void uart1_send(const char *buf)
+{
+    for (int i = 0; buf[i] != '\0'; i++) {
         uart_poll_out(uart_dev, buf[i]);
     }
 }
 
-/* ---------- ISR UART ---------- */
-void serial_cb(const struct device *dev, void *user_data)
+/* ---------- Helpers LED ---------- */
+static void led_init_if_available(void)
 {
-    ARG_UNUSED(dev);
-    ARG_UNUSED(user_data);
+#ifdef DT_ALIAS_LED0
+    if (device_is_ready(led_dev)) {
+        gpio_pin_configure(led_dev, led_pin, GPIO_OUTPUT_INACTIVE | led_flags);
+        gpio_pin_set(led_dev, led_pin, 0);
+    } else {
+        printk("Aviso: led0 não está pronto; continuando sem LED.\n");
+        led_dev = NULL;
+    }
+#else
+    led_dev = NULL;
+#endif
+}
 
-    uint8_t c;
-
-    if (!uart_irq_update(uart_dev)) return;
-    if (!uart_irq_rx_ready(uart_dev)) return;
-
-    while (uart_fifo_read(uart_dev, &c, 1) == 1) {
-
-        if ((c == '\n' || c == '\r') && rx_buf_pos > 0) {
-            rx_buf[rx_buf_pos] = '\0';
-
-            (void)k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
-
-            rx_buf_pos = 0;
-        }
-        else if (rx_buf_pos < (MSG_SIZE - 1)) {
-            rx_buf[rx_buf_pos++] = (char)c;
-        }
+static void led_set_on(void)
+{
+    if (led_dev && device_is_ready(led_dev)) {
+        gpio_pin_set(led_dev, led_pin, 1);
     }
 }
 
-/* ---------- THREAD RX (Placa B começa por aqui) ---------- */
+static void led_set_off(void)
+{
+    if (led_dev && device_is_ready(led_dev)) {
+        gpio_pin_set(led_dev, led_pin, 0);
+    }
+}
+
+/* ---------- THREAD TX (envia por 5s) ---------- */
+void tx_thread(void *a, void *b, void *c)
+{
+    ARG_UNUSED(a);
+    ARG_UNUSED(b);
+    ARG_UNUSED(c);
+
+    while (1) {
+        /* tenta pegar exclusão para TX */
+        k_mutex_lock(&tx_rx_mutex, K_FOREVER);
+
+        /* Indica modo TX */
+        led_set_off();
+
+        printk("\n[PLACA B / TX] Enviando pela UART1 por 5s...\n");
+
+        uint64_t start = k_uptime_get();
+        while (k_uptime_get() - start < 5000) {
+            const char msg[] = "[B] Oi A! Mensagem da PLACA B via UART1\r\n";
+            uart1_send(msg);
+            printk("[B → A] Mensagem enviada pela UART1.\n");
+            k_sleep(K_MSEC(500));
+        }
+
+        printk("[PLACA B / TX] Envio finalizado.\n");
+
+        k_mutex_unlock(&tx_rx_mutex);
+
+        k_sleep(K_MSEC(100));
+    }
+}
+
+/* ---------- THREAD RX (recebe por 5s) ---------- */
 void rx_thread(void *a, void *b, void *c)
 {
-    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+    ARG_UNUSED(a);
+    ARG_UNUSED(b);
+    ARG_UNUSED(c);
 
     char msg[MSG_SIZE];
 
     while (1) {
+        /* aguarda disponibilidade para RX */
         k_mutex_lock(&tx_rx_mutex, K_FOREVER);
 
-        print_uart("\r\n[RX/B] Modo RECEPÇÃO - 5s\r\n");
+        /* Indica modo RX */
+        led_set_on();
+
+        printk("\n[PLACA B / RX] Recebendo da PLACA A por 5s (LED verde ON)...\n");
 
         uint64_t start = k_uptime_get();
-
-        while ((k_uptime_get() - start) < 5000) {
-            int ret = k_msgq_get(&uart_msgq, &msg, K_MSEC(100));
-
-            if (ret == 0) {
-                print_uart("[RX/B] Recebido: ");
-                print_uart(msg);
-                print_uart("\r\n");
+        while (k_uptime_get() - start < 5000) {
+            if (k_msgq_get(&uart_msgq, &msg, K_MSEC(50)) == 0) {
+                /* imprime a mensagem recebida no monitor serial */
+                printk("[B ← A] Recebido pela UART1: %s\n", msg);
             }
         }
 
-        print_uart("[RX/B] Recepção finalizada — liberando mutex\r\n");
+        printk("[PLACA B / RX] Recepção finalizada (LED verde OFF).\n");
+        led_set_off();
+
         k_mutex_unlock(&tx_rx_mutex);
 
         k_sleep(K_MSEC(100));
     }
 }
 
-/* ---------- THREAD TX (executa após RX) ---------- */
-void tx_thread(void *a, void *b, void *c)
-{
-    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
-
-    while (1) {
-        k_mutex_lock(&tx_rx_mutex, K_FOREVER);
-
-        print_uart("\r\n[TX/B] Modo TRANSMISSÃO - 5s\r\n");
-
-        uint64_t start = k_uptime_get();
-        while ((k_uptime_get() - start) < 5000) {
-
-            print_uart("[TX/B] Mensagem da placa B\r\n");
-
-            k_sleep(K_MSEC(500));
-        }
-
-        print_uart("[TX/B] Transmissão finalizada — liberando mutex\r\n");
-        k_mutex_unlock(&tx_rx_mutex);
-
-        k_sleep(K_MSEC(100));
-    }
-}
-
-/* ---------- MAIN ----------- */
+/* ---------- MAIN ---------- */
 int main(void)
 {
-    int ret;
-
-#ifdef UART_DEVICE_NODE
-#else
-    printk("Erro: nó UART não definido.\n");
-    return -ENODEV;
-#endif
-
-    if (uart_dev == NULL) {
-        printk("Erro: uart_dev == NULL.\n");
-        return -ENODEV;
-    }
+    printk("=== Inicializando PLACA B (UART1) ===\n");
 
     if (!device_is_ready(uart_dev)) {
-        printk("Erro: driver UART não está pronto.\n");
-        return -EIO;
+        printk("ERRO: UART1 não está pronta!\n");
+        return 0;
     }
 
-#ifndef CONFIG_UART_INTERRUPT_DRIVEN
-    printk("Erro: CONFIG_UART_INTERRUPT_DRIVEN deve estar habilitado.\n");
-    return -ENOTSUP;
-#endif
+    /* Inicializa LED se possível */
+    led_init_if_available();
 
-    ret = uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
-    if (ret < 0) {
-        printk("Erro ao instalar callback UART: %d\n", ret);
-        return ret;
-    }
-
+    /* Configura callback e habilita RX IRQ */
+    uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
     uart_irq_rx_enable(uart_dev);
 
-    /* Pequeno teste da fila */
-    {
-        char tput[MSG_SIZE] = "testB";
-        char tget[MSG_SIZE] = {0};
+    printk("UART1 configurada. Criando threads (RX com prioridade maior para iniciar em RX)...\n");
 
-        if (k_msgq_put(&uart_msgq, &tput, K_NO_WAIT) == 0) {
-            k_msgq_get(&uart_msgq, &tget, K_NO_WAIT);
-        }
-    }
-
-    rx_buf_pos = 0;
-
-    /* Placa B inicia primeiro no RX */
-    k_thread_create(&rx_thread_data, rx_stack,
-                    K_THREAD_STACK_SIZEOF(rx_stack),
+    /* Criar threads: RX com prioridade maior (4) para garantir que inicie em RX */
+    k_thread_create(&rx_thread_data, rx_stack, K_THREAD_STACK_SIZEOF(rx_stack),
                     rx_thread, NULL, NULL, NULL,
-                    5, 0, K_NO_WAIT);
+                    4, 0, K_NO_WAIT);
 
-    k_thread_create(&tx_thread_data, tx_stack,
-                    K_THREAD_STACK_SIZEOF(tx_stack),
+    k_thread_create(&tx_thread_data, tx_stack, K_THREAD_STACK_SIZEOF(tx_stack),
                     tx_thread, NULL, NULL, NULL,
                     5, 0, K_NO_WAIT);
-
-    printk("Placa B iniciada com sucesso (RX → TX turnos).\n");
-    print_uart("Placa B iniciada com sucesso (RX → TX turnos).\r\n");
 
     return 0;
 }
